@@ -1,0 +1,192 @@
+###############################################################################
+# RAGMeUp – Docker Compose
+#
+# Services:
+#   postgres       – ParadeDB (Postgres + pgvector + BM25)
+#   python-server  – Flask/Gunicorn RAG backend
+#   node-server    – Express API for auth, chat, docs, feedback
+#   react-client   – Nginx serving the React SPA + reverse-proxying /api
+#
+# Only the react-client (nginx) port is exposed to the host.
+# All other services communicate over an internal Docker network.
+#
+# Persistent volumes:
+#   paradedb_data  – Postgres data directory
+#   python_data    – Python server document storage (/data)
+#   uploads_data   – Node server uploaded files
+#
+# IMPORTANT: Copy your server/.env into the same location – it is mounted
+# into the Python container at build time. Docker-specific values like
+# postgres_uri and data_directory are overridden automatically via the
+# entrypoint script.
+###############################################################################
+
+services:
+
+  # ---------------------------------------------------------------------------
+  # ParadeDB – Postgres with pgvector and pg_search (BM25)
+  # ---------------------------------------------------------------------------
+  postgres:
+    image: paradedb/paradedb:latest
+    container_name: ragmeup-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-langchain}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-langchain}
+      POSTGRES_DB: ${POSTGRES_DB:-langchain}
+    volumes:
+      - paradedb_data:/var/lib/postgresql/data
+    networks:
+      - ragmeup-internal
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-langchain} -d ${POSTGRES_DB:-langchain}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    # Security: drop all capabilities, add back only what Postgres needs
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - DAC_OVERRIDE
+      - FOWNER
+      - SETGID
+      - SETUID
+    # No ports exposed to host – internal network only
+    deploy:
+      resources:
+        limits:
+          memory: 1g
+
+  # ---------------------------------------------------------------------------
+  # Python RAG backend (Flask + Gunicorn)
+  # ---------------------------------------------------------------------------
+  python-server:
+    build:
+      context: ./server
+      dockerfile: Dockerfile
+    container_name: ragmeup-python
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      # These override values in .env via the entrypoint script
+      DOCKER_POSTGRES_URI: "postgresql://${POSTGRES_USER:-langchain}:${POSTGRES_PASSWORD:-langchain}@postgres:5432/${POSTGRES_DB:-langchain}"
+      DOCKER_DATA_DIRECTORY: "/data"
+    volumes:
+      # Mount host .env as .env.mounted; entrypoint copies and overrides it
+      - ./server/.env:/ragmeup/.env.mounted:ro
+      # Persistent document storage
+      - python_data:/data
+    networks:
+      - ragmeup-internal
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:5000/get_datasets')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 120s
+    cap_drop:
+      - ALL
+    # No ports exposed to host
+    deploy:
+      resources:
+        limits:
+          memory: 8g
+
+  # ---------------------------------------------------------------------------
+  # Node.js Express API server
+  # ---------------------------------------------------------------------------
+  node-server:
+    build:
+      context: ./ui/node-react/server
+      dockerfile: Dockerfile
+    container_name: ragmeup-node
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      python-server:
+        condition: service_started
+    environment:
+      PORT: "3001"
+      DATABASE_URL: "postgresql://${POSTGRES_USER:-langchain}:${POSTGRES_PASSWORD:-langchain}@postgres:5432/${POSTGRES_DB:-langchain}"
+      PYTHON_SERVER_URL: "http://python-server:5000"
+      JWT_SECRET: "${JWT_SECRET:-ragmeup-jwt-secret-change-me-in-production}"
+      NODE_ENV: "production"
+    volumes:
+      # Persistent uploads storage
+      - uploads_data:/app/uploads
+    networks:
+      - ragmeup-internal
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:3001/api/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    cap_drop:
+      - ALL
+    # No ports exposed to host
+    deploy:
+      resources:
+        limits:
+          memory: 512m
+
+  # ---------------------------------------------------------------------------
+  # React SPA served by Nginx (reverse-proxies /api → node-server)
+  # ---------------------------------------------------------------------------
+  react-client:
+    build:
+      context: ./ui/node-react/client
+      dockerfile: Dockerfile
+    container_name: ragmeup-client
+    restart: unless-stopped
+    depends_on:
+      node-server:
+        condition: service_healthy
+    ports:
+      # Only exposed port on the host
+      - "${HOST_PORT:-80}:80"
+    networks:
+      - ragmeup-internal
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:80"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_BIND_SERVICE   # Nginx needs this to bind to port 80
+    read_only: true
+    tmpfs:
+      - /var/cache/nginx
+      - /var/run
+      - /tmp
+    deploy:
+      resources:
+        limits:
+          memory: 128m
+
+# -----------------------------------------------------------------------------
+# Volumes
+# -----------------------------------------------------------------------------
+volumes:
+  paradedb_data:
+    driver: local
+  python_data:
+    driver: local
+  uploads_data:
+    driver: local
+
+# -----------------------------------------------------------------------------
+# Networks – internal only, no external access except via react-client
+# -----------------------------------------------------------------------------
+networks:
+  ragmeup-internal:
+    driver: bridge
+    internal: false  # react-client needs outbound for its exposed port

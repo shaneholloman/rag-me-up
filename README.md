@@ -1,53 +1,46 @@
-# 🚀 RAGMeUp
+# 🚀 RAG Me Up - by [SensAI.PT](https://www.sensai.pt)
 
 > A simple and extensible framework to build RAG (Retrieval-Augmented Generation) applications fast.
 
-[![License](https://img.shields.io/github/license/ErikTromp/RAGMeUp?style=flat-square)](https://github.com/ErikTromp/RAGMeUp/blob/main/LICENSE)
-[![GitHub Repo stars](https://img.shields.io/github/stars/ErikTromp/RAGMeUp?style=social)](https://github.com/ErikTromp/RAGMeUp/stargazers)
-[![GitHub issues](https://img.shields.io/github/issues/ErikTromp/RAGMeUp?style=flat-square)](https://github.com/ErikTromp/RAGMeUp/issues)
-[![Docs](https://img.shields.io/badge/docs-Docusaurus-blueviolet?logo=readthedocs&style=flat-square)](https://ragmeup.understandling.com)
+[![License](https://img.shields.io/github/license/ErikTromp/RAGMeUp?style=flat-square)](https://github.com/SensAI-PT/RAGMeUp/blob/main/LICENSE)
+[![GitHub Repo stars](https://img.shields.io/github/stars/ErikTromp/RAGMeUp?style=social)](https://github.com/SensAI-PT/RAGMeUp/stargazers)
+[![GitHub issues](https://img.shields.io/github/issues/ErikTromp/RAGMeUp?style=flat-square)](https://github.com/SensAI-PT/RAGMeUp/issues)
+[![Docs](https://img.shields.io/badge/docs-Docusaurus-blueviolet?logo=readthedocs&style=flat-square)](https://ragmeup.sensai.pt)
 
 ---
 
 ## ⚡ TL;DR – Installation & Quickstart
 
-**Server**
-```
+```bash
 # Clone the repo
-git clone https://github.com/ErikTromp/RAGMeUp.git
-cd RAGMeUp/server
+git clone https://github.com/SensAI-PT/RAGMeUp.git
+cd RAGMeUp
 
-# Set up a virtual environment (recommended)
-python3 -m venv .venv
-source .venv/bin/activate
+# Create and populate your Docker env file
+cp docker-compose.env.example .env
+# Edit .env and set at least POSTGRES_PASSWORD and JWT_SECRET
 
-# Install dependencies
-pip install -r requirements.txt
-
-# Run the RAG server
-python server.py
+# Build and start everything
+docker compose up --build -d
 ```
 
-**UI**
-```
-# In RAGMeUp folder in a separate shell, make sure you have JDK17+
-cd ui
-sbt run
-```
+React UI is available on `http://localhost` (or the `HOST_PORT` you set in `.env`).
 
 ## 📘 Documentation
 Full setup instructions, architecture docs, API references, and guides available at:
 
-👉 https://ragmeup.understandling.com
+👉 https://ragmeup.sensai.pt
 
 
-## 🧠 Why RAGMeUp?
+## 🧠 Why RAG Me Up?
 
 ⚙️ Modular: Use your own chunkers, vectorstores, or retrievers
 
 🚀 Fast to prototype: Focus on your RAG logic, not boilerplate
 
 🧩 Flexible: Plug-and-play architecture
+
+✨ Battle-tested: RAG Me Up has been used in many large-scale production settings, most notably in [SensAI.PT - Your AI personal trainer](https://www.sensai.pt)
 
 ## 🤝 Contributing
 We welcome pull requests, feedback, and ideas.

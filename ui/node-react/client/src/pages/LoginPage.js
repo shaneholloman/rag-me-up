@@ -29,7 +29,7 @@ export default function LoginPage() {
   return (
     <div className="login-page">
       <div className="login-card">
-        <h1>RAG Me Up</h1>
+        <h1>RAG Me Up - by SensAI.PT</h1>
         <p className="subtitle">
           {isRegister ? 'Create your account' : 'Sign in to your account'}
         </p>

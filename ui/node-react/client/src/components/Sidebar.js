@@ -19,7 +19,7 @@ export default function Sidebar({
   return (
     <aside className="sidebar">
       <div className="sidebar-header">
-        <h1>RAG Me Up</h1>
+        <h1>RAG Me Up - by SensAI.PT</h1>
         <div className="user-email">{user?.email}</div>
       </div>
 
