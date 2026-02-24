@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { v4 as uuidv4 } from 'uuid';
 import ReactMarkdown from 'react-markdown';
-import { sendMessage, getChat, submitFeedback } from '../api';
+import { sendMessageStream, getChat, submitFeedback } from '../api';
 import DocumentCards from './DocumentCards';
 import FeedbackModal from './FeedbackModal';
 
@@ -14,10 +14,14 @@ export default function ChatView({ chatId, selectedDatasets, onChatCreated }) {
   const [sessionId] = useState(() => chatId || uuidv4());
   const [messageOffset, setMessageOffset] = useState(0);
   const [isNewChat, setIsNewChat] = useState(!chatId);
+  const [streamingSteps, setStreamingSteps] = useState([]);
+  const [streamingContent, setStreamingContent] = useState('');
+  const [isStreaming, setIsStreaming] = useState(false);
   const messagesEndRef = useRef(null);
 
   // Feedback state
   const [feedbackModal, setFeedbackModal] = useState(null); // { chatId, messageOffset, type }
+  const [confirmedFeedback, setConfirmedFeedback] = useState({}); // { [offset]: 'positive'|'negative' }
 
   const scrollToBottom = useCallback(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -25,7 +29,7 @@ export default function ChatView({ chatId, selectedDatasets, onChatCreated }) {
 
   useEffect(() => {
     scrollToBottom();
-  }, [messages, loading, scrollToBottom]);
+  }, [messages, loading, streamingContent, streamingSteps, scrollToBottom]);
 
   // Load existing chat
   useEffect(() => {
@@ -65,6 +69,15 @@ export default function ChatView({ chatId, selectedDatasets, onChatCreated }) {
             const docs = safeParseJSON(lastAssistant.documents);
             if (Array.isArray(docs)) setDocuments(docs);
           }
+
+          // Load existing feedback so thumbs are disabled for already-rated messages
+          if (data.feedback && data.feedback.length > 0) {
+            const loaded = {};
+            for (const fb of data.feedback) {
+              loaded[fb.message_offset] = fb.feedback ? 'positive' : 'negative';
+            }
+            setConfirmedFeedback(loaded);
+          }
         } catch (err) {
           console.error('Failed to load chat:', err);
         }
@@ -89,6 +102,9 @@ export default function ChatView({ chatId, selectedDatasets, onChatCreated }) {
     setInput('');
     setLoading(true);
     setIsNewChat(false);
+    setIsStreaming(true);
+    setStreamingSteps([]);
+    setStreamingContent('');
 
     // Add user message optimistically
     const userMsg = { role: 'user', content: query, offset: messageOffset };
@@ -96,55 +112,98 @@ export default function ChatView({ chatId, selectedDatasets, onChatCreated }) {
     const currentOffset = messageOffset;
     setMessageOffset((prev) => prev + 1);
 
+    // Accumulate tokens so we can fall back if onDone never fires
+    let tokenAccumulator = '';
+    let streamedDocuments = null;
+    let doneHandled = false;
+    let doneData = null;
+
     try {
-      const data = await sendMessage(
+      await sendMessageStream(
         sessionId,
         query,
         history,
         documents,
         selectedDatasets,
-        currentOffset
+        currentOffset,
+        {
+          onStep: (step) => {
+            setStreamingSteps((prev) => [...prev, step]);
+          },
+          onToken: (token) => {
+            tokenAccumulator += token;
+            setStreamingContent(tokenAccumulator);
+          },
+          onDocuments: (docs) => {
+            streamedDocuments = docs;
+          },
+          onDone: (data) => {
+            doneHandled = true;
+            doneData = data;
+          },
+          onError: (error) => {
+            setMessages((prev) => [
+              ...prev,
+              { role: 'assistant', content: `Something went wrong: ${error}` },
+            ]);
+            doneHandled = true; // prevent fallback from also adding a message
+          },
+        }
       );
-
-      // If first message, notify parent about new chat
-      if (!chatId && currentOffset === 0) {
-        onChatCreated(sessionId, data.reply.substring(0, 50) + '...');
-        // The title will be set by the server, but we show a placeholder
-      }
-
-      const newMessages = [];
-
-      // Rewritten query
-      if (data.rewritten) {
-        newMessages.push({
-          role: 'rewritten',
-          content: `Your message has been rewritten:\n\n${data.rewritten}`,
-        });
-      }
-
-      // Assistant response
-      newMessages.push({
-        role: 'assistant',
-        content: data.reply,
-        documents: data.documents || [],
-        fetchedNewDocuments: data.fetched_new_documents,
-        offset: currentOffset + 1,
-      });
-
-      setMessages((prev) => [...prev, ...newMessages]);
-      setMessageOffset((prev) => prev + 1);
-      setHistory(data.history || []);
-
-      if (data.documents) {
-        setDocuments(data.documents);
-      }
     } catch (err) {
       setMessages((prev) => [
         ...prev,
         { role: 'assistant', content: `Something went wrong: ${err.message}` },
       ]);
+      doneHandled = true;
     } finally {
+      // Finalize messages: use doneData if available, otherwise fall back to streamed tokens
+      if (doneData) {
+        // If first message, notify parent about new chat
+        if (!chatId && currentOffset === 0) {
+          onChatCreated(sessionId, doneData.reply.substring(0, 50) + '...');
+        }
+
+        const newMessages = [];
+        if (doneData.rewritten) {
+          newMessages.push({
+            role: 'rewritten',
+            content: `Your message has been rewritten:\n\n${doneData.rewritten}`,
+          });
+        }
+        newMessages.push({
+          role: 'assistant',
+          content: doneData.reply,
+          documents: doneData.documents || [],
+          fetchedNewDocuments: doneData.fetched_new_documents,
+          offset: currentOffset + 1,
+        });
+
+        setMessages((prev) => [...prev, ...newMessages]);
+        setMessageOffset((prev) => prev + 1);
+        setHistory(doneData.history || []);
+        if (doneData.documents) {
+          setDocuments(doneData.documents);
+        }
+      } else if (!doneHandled && tokenAccumulator) {
+        // Fallback: onDone never fired but we have streamed content
+        setMessages((prev) => [
+          ...prev,
+          {
+            role: 'assistant',
+            content: tokenAccumulator,
+            documents: streamedDocuments || [],
+            fetchedNewDocuments: !!streamedDocuments,
+            offset: currentOffset + 1,
+          },
+        ]);
+        setMessageOffset((prev) => prev + 1);
+      }
+
       setLoading(false);
+      setIsStreaming(false);
+      setStreamingSteps([]);
+      setStreamingContent('');
     }
   };
 
@@ -168,6 +227,10 @@ export default function ChatView({ chatId, selectedDatasets, onChatCreated }) {
         feedbackModal.type === 'positive',
         text
       );
+      setConfirmedFeedback((prev) => ({
+        ...prev,
+        [feedbackModal.messageOffset]: feedbackModal.type,
+      }));
     } catch (err) {
       console.error('Feedback error:', err);
     }
@@ -225,6 +288,7 @@ export default function ChatView({ chatId, selectedDatasets, onChatCreated }) {
                     <FeedbackButtons
                       onPositive={() => handleFeedback('positive', msg.offset)}
                       onNegative={() => handleFeedback('negative', msg.offset)}
+                      confirmed={confirmedFeedback[msg.offset] || null}
                     />
                   )}
                 </div>
@@ -242,7 +306,45 @@ export default function ChatView({ chatId, selectedDatasets, onChatCreated }) {
           );
         })}
 
-        {loading && (
+        {loading && isStreaming && (
+          <div className="message-row agent">
+            <div className="message-bubble agent streaming-bubble">
+              {streamingSteps.length > 0 && (
+                <div className="streaming-steps">
+                  {streamingSteps.map((step, idx) => (
+                    <div
+                      key={idx}
+                      className={`streaming-step ${idx === streamingSteps.length - 1 && !streamingContent ? 'active' : 'completed'}`}
+                    >
+                      <span className="step-icon">
+                        {idx === streamingSteps.length - 1 && !streamingContent ? (
+                          <i className="fas fa-spinner fa-spin" />
+                        ) : (
+                          <i className="fas fa-check" />
+                        )}
+                      </span>
+                      <span className="step-text">{step}</span>
+                    </div>
+                  ))}
+                </div>
+              )}
+              {streamingContent && (
+                <div className="streaming-content">
+                  <ReactMarkdown>{streamingContent}</ReactMarkdown>
+                </div>
+              )}
+              {!streamingContent && streamingSteps.length === 0 && (
+                <div className="typing-indicator">
+                  <span />
+                  <span />
+                  <span />
+                </div>
+              )}
+            </div>
+          </div>
+        )}
+
+        {loading && !isStreaming && (
           <div className="message-row agent">
             <div className="message-bubble agent">
               <div className="typing-indicator">
@@ -290,33 +392,41 @@ export default function ChatView({ chatId, selectedDatasets, onChatCreated }) {
   );
 }
 
-function FeedbackButtons({ onPositive, onNegative }) {
-  const [submitted, setSubmitted] = useState(null);
-
+function FeedbackButtons({ onPositive, onNegative, confirmed }) {
   const handleClick = (type) => {
-    if (submitted) return;
-    setSubmitted(type);
+    if (confirmed) return;
     if (type === 'positive') onPositive();
     else onNegative();
   };
 
+  // Already rated — show a compact indicator instead of clickable thumbs
+  if (confirmed) {
+    return (
+      <div className="feedback-row">
+        <span className={`feedback-given ${confirmed}`}>
+          <i className={`fas fa-thumbs-${confirmed === 'positive' ? 'up' : 'down'}`} />
+          {' '}Feedback given
+        </span>
+      </div>
+    );
+  }
+
   return (
     <div className="feedback-row">
       <button
-        className={`feedback-btn positive ${submitted === 'positive' ? 'submitted' : ''} ${submitted && submitted !== 'positive' ? 'dimmed' : ''}`}
+        className="feedback-btn positive"
         onClick={() => handleClick('positive')}
         title="Good response"
       >
         <i className="far fa-thumbs-up" />
       </button>
       <button
-        className={`feedback-btn negative ${submitted === 'negative' ? 'submitted' : ''} ${submitted && submitted !== 'negative' ? 'dimmed' : ''}`}
+        className="feedback-btn negative"
         onClick={() => handleClick('negative')}
         title="Poor response"
       >
         <i className="far fa-thumbs-down" />
       </button>
-      {submitted && <span className="feedback-thanks">Thank you!</span>}
     </div>
   );
 }

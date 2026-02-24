@@ -1,9 +1,31 @@
-from flask import Flask, request, jsonify, send_file
+from flask import Flask, request, jsonify, send_file, Response
 import logging
-from dotenv import load_dotenv
+from dotenv import load_dotenv, dotenv_values
 import os
+import json
+import numpy as np
+from decimal import Decimal
 from RAGHelper import RAGHelper
 from psycopg2 import pool
+
+class SafeJSONEncoder(json.JSONEncoder):
+    """JSON encoder that handles numpy types, Decimals, and other edge cases."""
+    def default(self, obj):
+        if isinstance(obj, (np.integer,)):
+            return int(obj)
+        if isinstance(obj, (np.floating,)):
+            return float(obj)
+        if isinstance(obj, np.ndarray):
+            return obj.tolist()
+        if isinstance(obj, Decimal):
+            return float(obj)
+        if isinstance(obj, bytes):
+            return obj.decode('utf-8', errors='replace')
+        return super().default(obj)
+
+def safe_json_dumps(obj):
+    """JSON dumps with safe encoding for SSE events."""
+    return json.dumps(obj, cls=SafeJSONEncoder, ensure_ascii=False)
 
 # Initialize Flask application
 app = Flask(__name__)
@@ -84,6 +106,54 @@ def chat():
         for i, doc in enumerate(response_dict["documents"]):
             response_dict["documents"][i]["provenance"] = provenance_scores[i]["score"]
     return jsonify(response_dict)
+
+@app.route("/chat_stream", methods=['POST'])
+def chat_stream():
+    """
+    Streaming version of the chat endpoint using Server-Sent Events (SSE).
+    Streams pipeline steps and LLM tokens as they are generated.
+    """
+    json_data = request.get_json()
+    prompt = json_data.get('prompt')
+    history = json_data.get('history', [])
+    original_docs = json_data.get('docs', [])
+    datasets = json_data.get('datasets', [])
+
+    def generate():
+        try:
+            for event_type, event_data in raghelper.handle_user_interaction_stream(prompt, history, datasets):
+                if event_type == "step":
+                    yield f"event: step\ndata: {safe_json_dumps({'step': event_data})}\n\n"
+                elif event_type == "token":
+                    yield f"event: token\ndata: {safe_json_dumps({'token': event_data})}\n\n"
+                elif event_type == "documents":
+                    yield f"event: documents\ndata: {safe_json_dumps({'documents': event_data})}\n\n"
+                elif event_type == "done":
+                    metadata = event_data
+                    documents = metadata.get("documents") or original_docs
+                    provenance_scores = metadata.get("provenance_scores")
+                    if provenance_scores is not None and documents:
+                        for i, doc in enumerate(documents):
+                            if i < len(provenance_scores):
+                                documents[i]["provenance"] = provenance_scores[i]["score"]
+                    done_data = {
+                        "reply": metadata["reply"],
+                        "history": metadata["history"],
+                        "documents": documents,
+                        "rewritten": metadata["rewritten"],
+                        "question": prompt,
+                        "fetched_new_documents": metadata["fetched_new_documents"],
+                    }
+                    yield f"event: done\ndata: {safe_json_dumps(done_data)}\n\n"
+        except Exception as e:
+            logger.error(f"Streaming error: {e}", exc_info=True)
+            yield f"event: error\ndata: {safe_json_dumps({'error': str(e)})}\n\n"
+
+    return Response(generate(), mimetype='text/event-stream', headers={
+        'Cache-Control': 'no-cache',
+        'X-Accel-Buffering': 'no',
+        'Connection': 'keep-alive',
+    })
 
 @app.route("/get_documents", methods=['GET'])
 def get_documents():
@@ -173,6 +243,78 @@ def add_document():
 def get_datasets():
     datasets = raghelper.retriever.get_datasets()
     return jsonify(datasets)
+
+# ---- Configuration endpoints ----
+
+def _env_file_path():
+    """Return the path to the .env file used by this server."""
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+
+@app.route("/config", methods=['GET'])
+def get_config():
+    """Return all key-value pairs from the .env file."""
+    env_path = _env_file_path()
+    if not os.path.exists(env_path):
+        return jsonify({}), 200
+    values = dotenv_values(env_path)
+    return jsonify(dict(values)), 200
+
+@app.route("/config", methods=['PUT'])
+def update_config():
+    """
+    Update the .env file with the provided key-value pairs and reload
+    environment variables.  Optionally reinitialise heavy components
+    (LLM, reranker) when the caller sets ``reinitialize`` to true.
+    """
+    json_data = request.get_json()
+    new_values = json_data.get('config', {})
+    should_reinitialize = json_data.get('reinitialize', False)
+
+    if not new_values:
+        return jsonify({"error": "No config values provided"}), 400
+
+    env_path = _env_file_path()
+
+    # Read existing .env preserving order
+    existing_lines = []
+    existing_keys = {}
+    if os.path.exists(env_path):
+        with open(env_path, "r", encoding="utf-8") as f:
+            for line in f:
+                existing_lines.append(line)
+                stripped = line.strip()
+                if stripped and not stripped.startswith("#") and "=" in stripped:
+                    key = stripped.split("=", 1)[0]
+                    existing_keys[key] = len(existing_lines) - 1
+
+    # Update existing keys in place and collect new ones
+    updated_keys = set()
+    for key, value in new_values.items():
+        if key in existing_keys:
+            idx = existing_keys[key]
+            existing_lines[idx] = f'{key}={value}\n'
+            updated_keys.add(key)
+        else:
+            updated_keys.add(key)
+
+    # Append any truly new keys
+    for key, value in new_values.items():
+        if key not in existing_keys:
+            existing_lines.append(f'{key}={value}\n')
+
+    # Write the file
+    with open(env_path, "w", encoding="utf-8") as f:
+        f.writelines(existing_lines)
+
+    # Reload env vars into os.environ
+    load_dotenv(env_path, override=True)
+
+    # Optionally reinitialise the LLM / reranker
+    if should_reinitialize:
+        logger.info("Reinitializing LLM and dependent components after config change.")
+        raghelper.reload_llm()
+
+    return jsonify({"status": "ok", "updated": list(updated_keys)}), 200
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0")

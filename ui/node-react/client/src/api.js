@@ -74,6 +74,84 @@ export async function sendMessage(chatId, query, history, docs, datasets, messag
   return res.json();
 }
 
+/**
+ * Send a message with streaming via Server-Sent Events.
+ * Calls `onStep`, `onToken`, `onDocuments`, and `onDone` callbacks as events arrive.
+ * Returns a promise that resolves when streaming is complete.
+ */
+export async function sendMessageStream(chatId, query, history, docs, datasets, messageOffset, callbacks) {
+  const { onStep, onToken, onDocuments, onDone, onError } = callbacks;
+
+  const res = await fetch(`${API_BASE}/chats/${chatId}/message/stream`, {
+    method: 'POST',
+    headers: getHeaders(),
+    body: JSON.stringify({ query, history, docs, datasets, messageOffset }),
+  });
+
+  if (!res.ok) {
+    const errText = await res.text();
+    throw new Error(errText || 'Chat stream failed');
+  }
+
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+
+    buffer += decoder.decode(value, { stream: true });
+
+    // Process complete SSE messages (separated by double newline)
+    let boundary = buffer.indexOf('\n\n');
+    while (boundary !== -1) {
+      const message = buffer.substring(0, boundary);
+      buffer = buffer.substring(boundary + 2);
+
+      // Parse the SSE message
+      let eventType = 'message';
+      let dataStr = '';
+      for (const line of message.split('\n')) {
+        if (line.startsWith('event: ')) {
+          eventType = line.substring(7).trim();
+        } else if (line.startsWith('data: ')) {
+          dataStr += line.substring(6);
+        }
+      }
+
+      if (dataStr) {
+        try {
+          const parsed = JSON.parse(dataStr);
+          switch (eventType) {
+            case 'step':
+              onStep?.(parsed.step);
+              break;
+            case 'token':
+              onToken?.(parsed.token);
+              break;
+            case 'documents':
+              onDocuments?.(parsed.documents);
+              break;
+            case 'done':
+              onDone?.(parsed);
+              break;
+            case 'error':
+              onError?.(parsed.error);
+              break;
+            default:
+              break;
+          }
+        } catch (e) {
+          console.error('Failed to parse SSE data:', e, dataStr);
+        }
+      }
+
+      boundary = buffer.indexOf('\n\n');
+    }
+  }
+}
+
 export async function deleteChat(id) {
   const res = await fetch(`${API_BASE}/chats/${id}`, {
     method: 'DELETE',
@@ -134,6 +212,12 @@ export async function deleteDocument(filename) {
 }
 
 // Feedback
+export async function getFeedback() {
+  const res = await fetch(`${API_BASE}/feedback`, { headers: getHeaders() });
+  if (!res.ok) throw new Error('Failed to fetch feedback');
+  return res.json();
+}
+
 export async function submitFeedback(chatId, messageOffset, feedback, feedbackText) {
   const res = await fetch(`${API_BASE}/feedback`, {
     method: 'POST',
@@ -147,4 +231,22 @@ export async function submitFeedback(chatId, messageOffset, feedback, feedbackTe
   });
   if (!res.ok) throw new Error('Failed to submit feedback');
   return res.json();
+}
+
+// Config
+export async function getConfig() {
+  const res = await fetch(`${API_BASE}/config`, { headers: getHeaders() });
+  if (!res.ok) throw new Error('Failed to fetch config');
+  return res.json();
+}
+
+export async function updateConfig(config, reinitialize = false) {
+  const res = await fetch(`${API_BASE}/config`, {
+    method: 'PUT',
+    headers: getHeaders(),
+    body: JSON.stringify({ config, reinitialize }),
+  });
+  const data = await res.json();
+  if (!res.ok) throw new Error(data.error || 'Failed to update config');
+  return data;
 }

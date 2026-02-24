@@ -17,6 +17,16 @@ class OllamaClient():
         )
         return response.message.content
 
+    def chat_stream(self, messages):
+        response = ollama_chat(
+            model=self.model,
+            messages=messages,
+            stream=True,
+        )
+        for chunk in response:
+            if chunk.message and chunk.message.content:
+                yield chunk.message.content
+
 class LLMHelper:
     def __init__(self, logger):
         self.logger = logger
@@ -167,3 +177,101 @@ class LLMHelper:
         self.logger.debug(f"[LLMHelper] Response: {response}")
 
         return (response, thread)
+
+    def generate_response_stream(self, system_prompt, prompt, history):
+        """
+        Generate a streaming response from the LLM.
+        Returns (generator, thread) where generator yields text chunks.
+        """
+        history_to_use = history.copy()
+        if system_prompt is not None:
+            if len(history) > 0 and history[0]["role"] != "system":
+                history_to_use = [{"role": "system", "content": system_prompt}] + history
+            elif len(history) == 0:
+                history_to_use = [{"role": "system", "content": system_prompt}]
+            elif history[0]["role"] == "system":
+                history_to_use[0]["content"] = system_prompt
+
+        # Make the thread
+        thread = history_to_use + [{"role": "user", "content": prompt}]
+
+        self.logger.debug(f"[LLMHelper] Streaming thread: {thread}")
+
+        def _stream_openai(model):
+            stream = self.client.chat.completions.create(
+                model=model,
+                messages=thread,
+                temperature=self.temperature,
+                stream=True,
+            )
+            for chunk in stream:
+                if chunk.choices and chunk.choices[0].delta and chunk.choices[0].delta.content:
+                    yield chunk.choices[0].delta.content
+
+        def _stream_gemini():
+            gemini_thread = []
+            for message in thread:
+                if message["role"] == "user":
+                    gemini_thread.append(types.UserContent(message["content"]))
+                elif message["role"] == "assistant":
+                    gemini_thread.append(types.ModelContent(message["content"]))
+
+            if system_prompt is not None:
+                config = types.GenerateContentConfig(
+                    system_instruction=history_to_use[0]["content"],
+                    temperature=self.temperature,
+                )
+            else:
+                config = types.GenerateContentConfig(
+                    temperature=self.temperature,
+                )
+
+            stream = self.client.models.generate_content_stream(
+                model=os.getenv("gemini_model_name"),
+                contents=gemini_thread,
+                config=config,
+            )
+            for chunk in stream:
+                if chunk.text:
+                    yield chunk.text
+
+        def _stream_anthropic():
+            anthropic_thread = []
+            for message in thread:
+                if message["role"] != "system":
+                    new_message = {
+                        "role": message["role"],
+                        "content": [{"type": "text", "text": message["content"]}]
+                    }
+                    anthropic_thread.append(new_message)
+
+            kwargs = {
+                "model": os.getenv("anthropic_model_name"),
+                "temperature": self.temperature,
+                "messages": anthropic_thread,
+                "max_tokens": int(os.getenv("anthropic_max_tokens", "4096")),
+            }
+            if system_prompt is not None:
+                kwargs["system"] = history_to_use[0]["content"]
+
+            with self.client.messages.stream(**kwargs) as stream:
+                for text in stream.text_stream:
+                    yield text
+
+        def _stream_ollama():
+            for text in self.client.chat_stream(thread):
+                yield text
+
+        if os.getenv("use_openai") == "True" or os.getenv("use_azure") == "True":
+            model = os.getenv("openai_model_name")
+            if os.getenv("use_azure") == "True":
+                model = os.getenv("AZURE_OPENAI_CHAT_DEPLOYMENT_NAME")
+            return (_stream_openai(model), thread)
+        elif os.getenv("use_gemini") == "True":
+            return (_stream_gemini(), thread)
+        elif os.getenv("use_anthropic") == "True":
+            return (_stream_anthropic(), thread)
+        elif os.getenv("use_ollama") == "True":
+            return (_stream_ollama(), thread)
+        else:
+            raise ValueError("No LLM backend selected.")

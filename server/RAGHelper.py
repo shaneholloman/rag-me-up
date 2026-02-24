@@ -68,6 +68,27 @@ class RAGHelper:
     ############################
     ### Initialization functions
     ############################
+    def reload_llm(self):
+        """Reinitialise the LLM client (and reranker if enabled) after
+        environment variables have been refreshed.  This is called from
+        the /config PUT endpoint when ``reinitialize`` is requested."""
+        self.logger.info("Reloading LLM client.")
+        self.llm = LLMHelper(self.logger)
+
+        # Reinitialise reranker if configured
+        if os.getenv("rerank") == "True":
+            self.logger.info("Reinitializing reranker.")
+            self.reranker = Reranker()
+
+        # Re-check provenance
+        if os.getenv("provenance_method") == "similarity":
+            self.similarity_attribution = DocumentSimilarityAttribution()
+
+        # Summarization encoder
+        if os.getenv("use_summarization") == "True":
+            import tiktoken
+            self.tiktoken_encoder = tiktoken.encoding_for_model(os.getenv("summarization_encoder"))
+
     def initialize_embeddings(self):
         """Initialize the embeddings based on the CPU/GPU configuration."""
         embedding_model = os.getenv("embedding_model")
@@ -274,12 +295,14 @@ class RAGHelper:
             )
         return "\n\n".join(doc_strings)
 
-    def handle_documents(self, prompt, prompt_embedding, datasets):
+    def handle_documents(self, prompt, prompt_embedding, datasets, step_callback=None):
         # Reobtain documents with new question
         documents = self.retriever.get_relevant_documents(prompt, prompt_embedding, datasets)
 
         # Check if we need to apply the reranker and run it
         if os.getenv("rerank") == "True":
+            if step_callback:
+                step_callback(f"Reranking top {os.getenv('rerank_k')} documents...")
             self.logger.info("Reranking documents.")
             documents = self.reranker.rerank_documents(documents, prompt)[:int(os.getenv("rerank_k"))]
         else:
@@ -407,3 +430,155 @@ class RAGHelper:
         # Add the response to the history
         new_history.append({"role": "assistant", "content": response})
         return (response, documents, fetch_new_documents, rewritten, new_history, provenance_scores)
+
+    def handle_user_interaction_stream(self, prompt, history, datasets):
+        """
+        Streaming version of handle_user_interaction.
+        Yields SSE-formatted events for each pipeline step and then streams the LLM response tokens.
+        Event types:
+          - ("step", step_name)   : pipeline step status
+          - ("token", text)       : LLM response chunk
+          - ("done", metadata)    : final metadata dict with history, documents, etc.
+        """
+        import json as _json
+
+        rewritten = None
+        fetch_new_documents = True
+
+        # Summarization check
+        if len(history) > 0:
+            if os.getenv("use_summarization") == "True":
+                yield ("step", "Checking if history needs summarization...")
+                history_string = "\n\n".join([f"{message['role']}: {message['content']}" for message in history])
+                history_size = len(self.tiktoken_encoder.encode(history_string))
+                if history_size > int(os.getenv("summarization_threshold")):
+                    yield ("step", "Summarizing conversation history...")
+                    self.logger.info(f"Summarizing the history because it contains {history_size} tokens.")
+                    (response, _) = self.llm.generate_response(
+                        None,
+                        os.getenv("summarization_query").format(history=history_string),
+                        []
+                    )
+                    history = history[:1] + [{"role": "assistant", "content": response}]
+
+            # Check if we need to fetch new documents
+            yield ("step", "Checking if new documents are needed...")
+            self.logger.info("History is not empty, checking if we need to fetch new documents.")
+            (response, _) = self.llm.generate_response(
+                None,
+                os.getenv("rag_fetch_new_question").format(question=prompt),
+                history
+            )
+            if response.lower().strip().startswith("no"):
+                fetch_new_documents = False
+                yield ("step", "Using existing context (no new retrieval needed).")
+
+        # Fetch new documents if needed
+        documents = None
+        pending_steps = []  # collect steps from sub-calls that can't yield directly
+        if fetch_new_documents:
+            # HyDE
+            if os.getenv("use_hyde") == "True":
+                yield ("step", "Generating hypothetical document (HyDE)...")
+                (response, _) = self.llm.generate_response(
+                    None,
+                    os.getenv("hyde_query").format(question=prompt),
+                    []
+                )
+                prompt = response
+
+            yield ("step", "Retrieving relevant documents...")
+            self.logger.info("Fetching new documents.")
+            prompt_embedding = self.embeddings.encode(prompt)
+            documents = self.handle_documents(prompt, prompt_embedding, datasets, step_callback=lambda s: pending_steps.append(s))
+            for s in pending_steps:
+                yield ("step", s)
+            pending_steps.clear()
+
+            # Rewrite loop
+            if os.getenv("use_rewrite_loop") == "True" and not os.getenv("use_hyde") == "True":
+                yield ("step", "Checking if documents contain the answer...")
+                self.logger.info("Rewrite is enabled - checking if the fetched documents contain the answer.")
+                (response, _) = self.llm.generate_response(
+                    os.getenv("rewrite_query_instruction").format(context=self.format_documents(documents)),
+                    os.getenv("rewrite_query_question").format(question=prompt),
+                    []
+                )
+                if response.lower().strip().startswith("no"):
+                    yield ("step", "Rewriting query for better results...")
+                    self.logger.info("Rewrite is enabled and the answer is not in the documents - rewriting the query.")
+                    (new_prompt, _) = self.llm.generate_response(
+                        None,
+                        os.getenv("rewrite_query_prompt").format(question=prompt, motivation=f"Can I find the answer in the documents: {response}"),
+                        []
+                    )
+                    self.logger.info(f"Rewrite complete, original query: {prompt}, rewritten query: {new_prompt}")
+                    rewritten = new_prompt
+                    yield ("step", "Re-retrieving documents with improved query...")
+                    documents = self.handle_documents(new_prompt, prompt_embedding, datasets, step_callback=lambda s: pending_steps.append(s))
+                    for s in pending_steps:
+                        yield ("step", s)
+                    pending_steps.clear()
+                else:
+                    yield ("step", "Documents look relevant, proceeding...")
+                    self.logger.info("Rewrite is enabled but the query is adequate.")
+            else:
+                self.logger.info("Rewrite is disabled - using the original query.")
+
+        # RE2
+        if os.getenv("use_re2") == "True" and not os.getenv("use_hyde") == "True":
+            yield ("step", "Applying RE2 (Re-reading) prompt enhancement...")
+            prompt = f"{prompt}\n{os.getenv('re2_prompt')}\n{prompt}"
+
+        # Send documents to the client before LLM generation
+        if documents:
+            yield ("documents", documents)
+
+        # Stream the LLM response
+        yield ("step", "Generating answer...")
+        full_response_chunks = []
+
+        if len(history) == 0:
+            (stream, new_history) = self.llm.generate_response_stream(
+                os.getenv("rag_instruction").format(context=self.format_documents(documents)),
+                os.getenv("rag_question_initial").format(question=prompt),
+                []
+            )
+        elif fetch_new_documents:
+            (stream, new_history) = self.llm.generate_response_stream(
+                os.getenv("rag_instruction").format(context=self.format_documents(documents)),
+                os.getenv("rag_question_followup").format(question=prompt),
+                [message for message in history if message["role"] != "system"]
+            )
+        else:
+            (stream, new_history) = self.llm.generate_response_stream(
+                None,
+                os.getenv("rag_question_followup").format(question=prompt),
+                history
+            )
+
+        for chunk in stream:
+            full_response_chunks.append(chunk)
+            yield ("token", chunk)
+
+        response = "".join(full_response_chunks)
+
+        # Compute provenance
+        provenance_scores = None
+        provenance_method = os.getenv("provenance_method", "none")
+        if fetch_new_documents and documents and provenance_method in ["rerank", "llm", "similarity"]:
+            yield ("step", f"Computing provenance scores ({provenance_method})...")
+            provenance_scores = self.compute_provenance_scores(prompt, documents, response)
+
+        # Add the response to the history
+        new_history.append({"role": "assistant", "content": response})
+
+        # Yield final metadata
+        yield ("done", {
+            "reply": response,
+            "history": new_history,
+            "documents": documents,
+            "rewritten": rewritten,
+            "fetched_new_documents": fetch_new_documents,
+            "provenance_scores": provenance_scores,
+        })

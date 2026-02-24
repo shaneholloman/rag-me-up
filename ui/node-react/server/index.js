@@ -7,6 +7,7 @@ const chatRoutes = require('./routes/chat');
 const documentRoutes = require('./routes/documents');
 const datasetRoutes = require('./routes/datasets');
 const feedbackRoutes = require('./routes/feedback');
+const configRoutes = require('./routes/config');
 const { runMigrations } = require('./db/migrate');
 
 const app = express();
@@ -33,6 +34,7 @@ app.use('/api/chats', chatRoutes);
 app.use('/api/documents', documentRoutes);
 app.use('/api/datasets', datasetRoutes);
 app.use('/api/feedback', feedbackRoutes);
+app.use('/api/config', configRoutes);
 
 // Health check
 app.get('/api/health', (req, res) => {

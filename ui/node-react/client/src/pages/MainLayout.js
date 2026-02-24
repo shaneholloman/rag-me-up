@@ -4,6 +4,8 @@ import { getDatasets, getChats, deleteChat as deleteChatApi } from '../api';
 import Sidebar from '../components/Sidebar';
 import ChatView from '../components/ChatView';
 import DocumentsPage from '../components/DocumentsPage';
+import ConfigPage from '../components/ConfigPage';
+import FeedbackPage from '../components/FeedbackPage';
 
 export default function MainLayout() {
   const { user, logoutUser } = useAuth();
@@ -84,8 +86,12 @@ export default function MainLayout() {
         onLogout={logoutUser}
       />
       <div className="main-content">
-        {activeView === 'documents' ? (
+        {activeView === 'config' ? (
+          <ConfigPage />
+        ) : activeView === 'documents' ? (
           <DocumentsPage />
+        ) : activeView === 'feedback' ? (
+          <FeedbackPage />
         ) : (
           <ChatView
             key={activeChatId || 'new'}

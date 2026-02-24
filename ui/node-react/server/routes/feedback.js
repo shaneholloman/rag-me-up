@@ -5,6 +5,41 @@ const router = express.Router();
 
 router.use(authMiddleware);
 
+// Get all feedback for the current user's chats, joined with Q&A messages
+router.get('/', async (req, res) => {
+  try {
+    const result = await req.db.query(
+      `SELECT
+         f.chat_id,
+         f.message_offset,
+         f.feedback,
+         f.feedback_text,
+         c.title AS chat_title,
+         -- The assistant message that was rated (feedback.message_offset points to the assistant msg)
+         am.text AS answer,
+         am.documents,
+         -- The preceding user message (offset - 1, or - 2 if system msg exists)
+         (
+           SELECT qm.text FROM chat_messages qm
+           WHERE qm.chat_id = f.chat_id
+             AND qm.role = 'user'
+             AND qm.message_offset < f.message_offset
+           ORDER BY qm.message_offset DESC
+           LIMIT 1
+         ) AS question
+       FROM feedback f
+       JOIN chats c ON c.id = f.chat_id AND c.user_id = $1
+       LEFT JOIN chat_messages am ON am.chat_id = f.chat_id AND am.message_offset = f.message_offset
+       ORDER BY c.created_at DESC, f.message_offset DESC`,
+      [req.user.id]
+    );
+    res.json(result.rows);
+  } catch (err) {
+    console.error('Get feedback error:', err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
 router.post('/', async (req, res) => {
   const { chat_id, message_offset, feedback, feedback_text } = req.body;
 

@@ -36,6 +36,16 @@ export default function Sidebar({
           onClick={() => onViewChange('documents')}
         >
           <i className="fas fa-folder" /> Documents
+        </button>        <button
+          className={`sidebar-nav-btn ${activeView === 'config' ? 'active' : ''}`}
+          onClick={() => onViewChange('config')}
+        >
+          <i className="fas fa-sliders-h" /> Settings
+        </button>        <button
+          className={`sidebar-nav-btn ${activeView === 'feedback' ? 'active' : ''}`}
+          onClick={() => onViewChange('feedback')}
+        >
+          <i className="fas fa-chart-bar" /> Feedback
         </button>
       </div>
 

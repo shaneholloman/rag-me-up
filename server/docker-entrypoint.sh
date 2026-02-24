@@ -15,11 +15,16 @@ if [ -f /ragmeup/.env.mounted ]; then
   if [ -n "${DOCKER_DATA_DIRECTORY:-}" ]; then
     sed -i "s|^data_directory=.*|data_directory='${DOCKER_DATA_DIRECTORY}'|" /ragmeup/.env
   fi
+
+  # Force CPU-only mode inside Docker (no CUDA/GPU access)
+  sed -i "s|^embedding_cpu=.*|embedding_cpu=True|" /ragmeup/.env
 fi
 
 exec gunicorn \
   --bind 0.0.0.0:5000 \
   --workers 1 \
+  --threads 4 \
+  --worker-class gthread \
   --timeout 600 \
   --graceful-timeout 300 \
   server:app

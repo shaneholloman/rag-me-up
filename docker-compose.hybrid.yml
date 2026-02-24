@@ -1,0 +1,45 @@
+###############################################################################
+# RAGMeUp – Docker Compose HYBRID override
+#
+# Use this to run only Postgres, Node server, and React client in Docker,
+# while running the Python RAG server standalone on the host (with GPU access).
+#
+# Usage:
+#   docker compose --env-file docker-compose.env \
+#     -f docker-compose.yml -f docker-compose.hybrid.yml up --build -d
+#
+# Then run the Python server separately:
+#   cd server
+#   python server.py
+#
+# The Node server will reach the host Python server via PYTHON_SERVER_URL
+# defined in docker-compose.env (default: http://host.docker.internal:5000).
+###############################################################################
+
+services:
+
+  # Disable the Dockerized Python server
+  python-server:
+    profiles:
+      - disabled
+
+  # Override Node server to point to host Python server; mark python-server
+  # dependency as optional so it doesn't block when the profile is disabled.
+  node-server:
+    depends_on:
+      postgres:
+        condition: service_healthy
+      python-server:
+        condition: service_started
+        required: false
+    environment:
+      PORT: "3001"
+      DATABASE_URL: "postgresql://${POSTGRES_USER:-langchain}:${POSTGRES_PASSWORD:-langchain}@postgres:5432/${POSTGRES_DB:-langchain}"
+      PYTHON_SERVER_URL: "${PYTHON_SERVER_URL:-http://host.docker.internal:5000}"
+      JWT_SECRET: "${JWT_SECRET:-ragmeup-jwt-secret-change-me-in-production}"
+      NODE_ENV: "production"
+
+  # Postgres needs to expose its port so the standalone Python server can reach it
+  postgres:
+    ports:
+      - "${POSTGRES_PORT:-6024}:5432"
