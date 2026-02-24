@@ -17,14 +17,14 @@ git clone https://github.com/SensAI-PT/RAGMeUp.git
 cd RAGMeUp
 
 # Create and populate your Docker env file
-cp docker-compose.env.example .env
-# Edit .env and set at least POSTGRES_PASSWORD and JWT_SECRET
+cp docker-compose.env.example docker-compose.env
+# Edit docker-compose.env and set at least POSTGRES_PASSWORD and JWT_SECRET
 
 # Build and start everything
-docker compose up --build -d
+docker compose --env-file docker-compose.env up --build -d
 ```
 
-React UI is available on `http://localhost` (or the `HOST_PORT` you set in `.env`).
+React UI is available on `http://localhost` (or the `HOST_PORT` you set in `docker-compose.env`).
 
 ## 📘 Documentation
 Full setup instructions, architecture docs, API references, and guides available at:
